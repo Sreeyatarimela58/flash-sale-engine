@@ -1,0 +1,22 @@
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: flashsale-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: flashsale
+      POSTGRES_PASSWORD: pass123
+      POSTGRES_DB: flashsale_engine
+    ports:
+      - "5432:5432"
+    volumes:
+      - flashsale_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flashsale -d flashsale_engine"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  flashsale_pgdata:
