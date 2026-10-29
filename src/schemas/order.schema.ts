@@ -14,7 +14,5 @@ export const cancelOrderSchema = z.object({
   userId: z.string().trim().min(1, "User ID is required"),
 });
 
-export const cancelReservationSchema = cancelOrderSchema;
-
 export type CreateOrderInput = z.infer<typeof createOrderSchema>;
 export type CancelOrderInput = z.infer<typeof cancelOrderSchema>;
