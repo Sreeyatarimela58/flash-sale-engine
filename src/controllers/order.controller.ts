@@ -65,7 +65,7 @@ export async function createOrder(req: Request, res: Response, next: NextFunctio
       const product = updatedProducts[0]!;
       const totalAmountInCents = quantity * product.priceInCents;
 
-      // 2. Create the internal Reservation holding the stock
+      // 2. Create internal Reservation holding inventory
       const reservation = await tx.reservation.create({
         data: {
           productId,
@@ -76,7 +76,7 @@ export async function createOrder(req: Request, res: Response, next: NextFunctio
         },
       });
 
-      // 3. Create the customer Order linked to the reservation
+      // 3. Create customer Order linked 1-to-1 with the reservation
       const order = await tx.order.create({
         data: {
           reservationId: reservation.id,
@@ -123,7 +123,7 @@ export async function createOrder(req: Request, res: Response, next: NextFunctio
 }
 
 /**
- * Fetch Order details by ID
+ * Fetch Order details by ID with live countdown information
  */
 export async function getOrderById(req: Request, res: Response, next: NextFunction) {
   try {
@@ -161,17 +161,32 @@ export async function getOrderById(req: Request, res: Response, next: NextFuncti
       return res.status(404).json({ error: "Order not found" });
     }
 
-    return res.status(200).json({ data: order });
+    const now = new Date();
+    const isExpired = order.status === "PENDING" && now > order.reservation.expiresAt;
+    const expiresInSeconds = Math.max(
+      0,
+      Math.floor((order.reservation.expiresAt.getTime() - now.getTime()) / 1000)
+    );
+
+    return res.status(200).json({
+      data: {
+        ...order,
+        isExpired,
+        expiresInSeconds,
+      },
+    });
   } catch (err) {
     return next(err);
   }
 }
 
 /**
- * User cancels a pending order:
- * 1. Checks order is in PENDING status
- * 2. Marks order CANCELLED and reservation CANCELLED
- * 3. Atomically restores availableStock back to product
+ * Safe, Atomic Order Cancellation:
+ * Protects against race conditions and double-restoration:
+ * 1. Checks ownership and validates state.
+ * 2. Conditionally transitions order PENDING -> CANCELLED.
+ * 3. Conditionally transitions reservation RESERVED -> CANCELLED (ensuring expiresAt > NOW).
+ * 4. Only if both transitions succeed, restores stock atomically to Product.
  */
 export async function cancelOrder(req: Request, res: Response, next: NextFunction) {
   try {
@@ -195,6 +210,7 @@ export async function cancelOrder(req: Request, res: Response, next: NextFunctio
     const { userId } = bodyResult.data;
 
     const result = await prisma.$transaction(async (tx) => {
+      // 1. Fetch current order to inspect ownership and current state
       const order = await tx.order.findUnique({
         where: { id },
         include: { reservation: true },
@@ -211,20 +227,40 @@ export async function cancelOrder(req: Request, res: Response, next: NextFunctio
           currentStatus: order.reservation.status,
         };
       }
+      if (new Date() > order.reservation.expiresAt) {
+        return { error: "EXPIRED" as const };
+      }
 
-      // Transition Order to CANCELLED
-      const updatedOrder = await tx.order.update({
-        where: { id },
-        data: { status: "CANCELLED" },
-      });
+      // 2. Atomic conditional update on order (guarantees idempotent state transition)
+      const cancelledOrders = await tx.$queryRaw<Array<{ id: string; status: string }>>`
+        UPDATE "orders"
+        SET "status" = 'CANCELLED'::"OrderStatus",
+            "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = ${id}
+          AND "status" = 'PENDING'::"OrderStatus"
+        RETURNING "id", "status"::text;
+      `;
 
-      // Transition Reservation to CANCELLED
-      await tx.reservation.update({
-        where: { id: order.reservationId },
-        data: { status: "CANCELLED" },
-      });
+      if (!cancelledOrders || cancelledOrders.length === 0) {
+        return { error: "ALREADY_PROCESSED" as const };
+      }
 
-      // Atomically restore stock back to product
+      // 3. Atomic conditional update on reservation (ensures not expired or already cancelled)
+      const cancelledReservations = await tx.$queryRaw<Array<{ id: string }>>`
+        UPDATE "reservations"
+        SET "status" = 'CANCELLED'::"ReservationStatus",
+            "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = ${order.reservationId}
+          AND "status" = 'RESERVED'::"ReservationStatus"
+          AND "expiresAt" > CURRENT_TIMESTAMP
+        RETURNING "id";
+      `;
+
+      if (!cancelledReservations || cancelledReservations.length === 0) {
+        return { error: "EXPIRED_OR_PROCESSED" as const };
+      }
+
+      // 4. Atomically restore inventory to product (only executed if both transitions succeeded)
       const updatedProducts = await tx.$queryRaw<Array<{ id: string; availableStock: number }>>`
         UPDATE "products"
         SET "availableStock" = "availableStock" + ${order.quantity},
@@ -234,7 +270,8 @@ export async function cancelOrder(req: Request, res: Response, next: NextFunctio
       `;
 
       return {
-        order: updatedOrder,
+        orderId: order.id,
+        status: "CANCELLED",
         restoredStock: updatedProducts[0]?.availableStock,
       };
     });
@@ -253,14 +290,23 @@ export async function cancelOrder(req: Request, res: Response, next: NextFunctio
           return res.status(409).json({
             error: `Cannot cancel order. Associated reservation is ${result.currentStatus}`,
           });
+        case "EXPIRED":
+        case "EXPIRED_OR_PROCESSED":
+          return res.status(409).json({
+            error: "Reservation hold has already expired and cannot be manually cancelled",
+          });
+        case "ALREADY_PROCESSED":
+          return res.status(409).json({
+            error: "Order was already cancelled or processed by another request",
+          });
       }
     }
 
     return res.status(200).json({
       message: "Order cancelled successfully and inventory restored to stock",
       data: {
-        orderId: result.order.id,
-        status: result.order.status,
+        orderId: result.orderId,
+        status: result.status,
         availableStock: result.restoredStock,
       },
     });
