@@ -2,6 +2,7 @@ import express, { type Request, type Response, type NextFunction } from "express
 import cors from "cors";
 import { healthRouter } from "./routes/health.routes.js";
 import { productRouter } from "./routes/product.routes.js";
+import { reservationRouter } from "./routes/reservation.routes.js";
 
 export const app = express();
 
@@ -11,6 +12,7 @@ app.use(express.json());
 // Routes
 app.use("/health", healthRouter);
 app.use("/products", productRouter);
+app.use("/reservations", reservationRouter);
 
 // 404 handler
 app.use((_req: Request, res: Response) => {
