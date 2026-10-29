@@ -3,11 +3,11 @@ import { prisma } from "../db/prisma.js";
 import type { Server } from "node:http";
 
 let server: Server;
-const TEST_PORT = 3997;
+const TEST_PORT = 3996;
 const BASE_URL = `http://localhost:${TEST_PORT}`;
 
 async function runTests() {
-  console.log("=== Running Order & Reservation State Machine Tests ===");
+  console.log("=== Running Unified Order Checkout & Lifecycle Integration Tests ===");
 
   await new Promise<void>((resolve) => {
     server = app.listen(TEST_PORT, () => {
@@ -22,19 +22,20 @@ async function runTests() {
     // -------------------------------------------------------------
     const product = await prisma.product.create({
       data: {
-        name: "Mechanical Gaming Keyboard RGB",
-        description: "Special sale edition.",
-        priceInCents: 15000, // $150.00
-        totalStock: 20,
-        availableStock: 20,
+        name: "PlayStation Portal Remote Player",
+        description: "Flash drop exclusive bundle.",
+        priceInCents: 19999, // $199.99
+        totalStock: 10,
+        availableStock: 10,
       },
     });
 
     // -------------------------------------------------------------
-    // Test 1: Successful Order Creation from Active Reservation
+    // Test 1: Unified "Buy Now" Checkout
+    // (Stock atomically held + Reservation created + Order created PENDING)
     // -------------------------------------------------------------
-    console.log("\n[Test 1] Valid Order Creation (RESERVED -> CONFIRMED & Order PENDING)");
-    const resRes = await fetch(`${BASE_URL}/reservations`, {
+    console.log("\n[Test 1] Unified 'Buy Now' Checkout (POST /orders)");
+    const checkoutRes = await fetch(`${BASE_URL}/orders`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -43,177 +44,184 @@ async function runTests() {
         quantity: 2,
       }),
     });
-    if (resRes.status !== 201) throw new Error(`Reservation failed with ${resRes.status}`);
-    const { data: reservation1 } = (await resRes.json()) as { data: { id: string } };
-
-    const orderRes = await fetch(`${BASE_URL}/orders`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        reservationId: reservation1.id,
-        userId: "user-buyer-1",
-      }),
-    });
-    if (orderRes.status !== 201) throw new Error(`Order creation failed with ${orderRes.status}`);
-    const orderData = (await orderRes.json()) as {
+    if (checkoutRes.status !== 201) throw new Error(`Expected 201, got ${checkoutRes.status}`);
+    const checkoutData = (await checkoutRes.json()) as {
       data: {
-        order: { id: string; status: string; totalAmountInCents: number; quantity: number };
-        reservationStatus: string;
+        order: { id: string; status: string; totalAmountInCents: number; reservationId: string };
+        reservation: { id: string; status: string; expiresAt: string };
+        remainingStock: number;
       };
     };
 
-    if (orderData.data.order.status !== "PENDING") {
-      throw new Error(`Expected order status PENDING, got ${orderData.data.order.status}`);
+    if (checkoutData.data.order.status !== "PENDING") {
+      throw new Error(`Expected order status PENDING, got ${checkoutData.data.order.status}`);
     }
-    if (orderData.data.order.totalAmountInCents !== 30000) {
-      throw new Error(`Expected total 30000 cents, got ${orderData.data.order.totalAmountInCents}`);
+    if (checkoutData.data.order.totalAmountInCents !== 39998) {
+      throw new Error(`Expected total 39998 cents, got ${checkoutData.data.order.totalAmountInCents}`);
+    }
+    if (checkoutData.data.reservation.status !== "RESERVED") {
+      throw new Error(`Expected reservation status RESERVED, got ${checkoutData.data.reservation.status}`);
+    }
+    if (checkoutData.data.remainingStock !== 8) {
+      throw new Error(`Expected remaining stock 8, got ${checkoutData.data.remainingStock}`);
     }
 
-    // Verify DB state: reservation should now be CONFIRMED
-    const dbReservation1 = await prisma.reservation.findUniqueOrThrow({ where: { id: reservation1.id } });
-    if (dbReservation1.status !== "CONFIRMED") {
-      throw new Error(`Expected DB reservation CONFIRMED, found ${dbReservation1.status}`);
+    // Verify DB states directly in PostgreSQL
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: checkoutData.data.order.id } });
+    const dbReservation = await prisma.reservation.findUniqueOrThrow({ where: { id: dbOrder.reservationId } });
+    const dbProduct = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+
+    if (dbOrder.status !== "PENDING" || dbReservation.status !== "RESERVED" || dbProduct.availableStock !== 8) {
+      throw new Error("PostgreSQL state mismatch after unified checkout");
     }
-    console.log("✓ Order created successfully. Reservation transitioned to CONFIRMED.");
+    console.log("✓ Unified order created. Internal reservation active (RESERVED) with 5-min timer. DB stock: 8.");
 
     // -------------------------------------------------------------
-    // Test 2: Cannot double-order on already CONFIRMED reservation
+    // Test 2: Input validation
     // -------------------------------------------------------------
-    console.log("\n[Test 2] Double-order prevention on CONFIRMED reservation");
-    const duplicateOrderRes = await fetch(`${BASE_URL}/orders`, {
+    console.log("\n[Test 2] Input validation: non-positive quantity rejected");
+    const badInputRes = await fetch(`${BASE_URL}/orders`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        reservationId: reservation1.id,
+        productId: product.id,
         userId: "user-buyer-1",
+        quantity: 0,
       }),
     });
-    if (duplicateOrderRes.status !== 409) {
-      throw new Error(`Expected 409 on duplicate order, got ${duplicateOrderRes.status}`);
-    }
-    console.log("✓ Correctly rejected double-order attempt with 409 Conflict.");
+    if (badInputRes.status !== 400) throw new Error(`Expected 400, got ${badInputRes.status}`);
+    console.log("✓ Correctly rejected non-positive quantity with 400 Bad Request.");
 
     // -------------------------------------------------------------
-    // Test 3: Unauthorized user attempting to convert someone else's reservation
+    // Test 3: Insufficient stock rejection
     // -------------------------------------------------------------
-    console.log("\n[Test 3] Authorization check: user-imposter ordering user-buyer-1's hold");
-    const resRes2 = await fetch(`${BASE_URL}/reservations`, {
+    console.log("\n[Test 3] Insufficient inventory rejection");
+    const overstockRes = await fetch(`${BASE_URL}/orders`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         productId: product.id,
-        userId: "user-legit",
-        quantity: 1,
+        userId: "user-greedy",
+        quantity: 9, // Only 8 left
       }),
     });
-    const { data: reservation2 } = (await resRes2.json()) as { data: { id: string } };
-
-    const imposterOrderRes = await fetch(`${BASE_URL}/orders`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        reservationId: reservation2.id,
-        userId: "user-imposter",
-      }),
-    });
-    if (imposterOrderRes.status !== 403) {
-      throw new Error(`Expected 403 Forbidden, got ${imposterOrderRes.status}`);
-    }
-    console.log("✓ Correctly rejected unauthorized user with 403 Forbidden.");
+    if (overstockRes.status !== 409) throw new Error(`Expected 409, got ${overstockRes.status}`);
+    console.log("✓ Correctly rejected checkout exceeding available inventory with 409 Conflict.");
 
     // -------------------------------------------------------------
-    // Test 4: Cannot order an EXPIRED reservation
+    // Test 4: HIGH-CONCURRENCY UNIFIED CHECKOUT RUSH
     // -------------------------------------------------------------
-    console.log("\n[Test 4] Cannot create order from an expired reservation");
-    const expiredReservation = await prisma.reservation.create({
+    console.log("\n[Test 4] High-concurrency flash sale rush: 30 parallel users buying 5 items");
+    const flashItem = await prisma.product.create({
       data: {
-        productId: product.id,
-        userId: "user-late",
-        quantity: 1,
-        status: "RESERVED",
-        expiresAt: new Date(Date.now() - 10000), // 10 seconds in the past
+        name: "Yeezy Boost 350 V2 - Midnight Black Drop",
+        description: "Extremely limited supply.",
+        priceInCents: 22000,
+        totalStock: 5,
+        availableStock: 5,
       },
     });
 
-    const expiredOrderRes = await fetch(`${BASE_URL}/orders`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        reservationId: expiredReservation.id,
-        userId: "user-late",
-      }),
+    const requests = Array.from({ length: 30 }, (_, index) => {
+      return fetch(`${BASE_URL}/orders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          productId: flashItem.id,
+          userId: `flash-user-${index + 1}`,
+          quantity: 1,
+        }),
+      });
     });
-    if (expiredOrderRes.status !== 409) {
-      throw new Error(`Expected 409 for expired hold, got ${expiredOrderRes.status}`);
+
+    const responses = await Promise.all(requests);
+    const successCount = responses.filter((r) => r.status === 201).length;
+    const conflictCount = responses.filter((r) => r.status === 409).length;
+
+    console.log(`Results: ${successCount} orders created (201), ${conflictCount} rejected (409).`);
+
+    if (successCount !== 5 || conflictCount !== 25) {
+      throw new Error(`CONCURRENCY INVARIANT BROKEN: Expected 5 successes and 25 conflicts.`);
     }
-    console.log("✓ Correctly rejected expired reservation with 409 Conflict.");
+
+    // Verify DB stock is exactly 0
+    const flashItemDb = await prisma.product.findUniqueOrThrow({ where: { id: flashItem.id } });
+    if (flashItemDb.availableStock !== 0) {
+      throw new Error(`Stock mismatch: Expected 0, found ${flashItemDb.availableStock}`);
+    }
+
+    const orderCount = await prisma.order.count({ where: { productId: flashItem.id } });
+    if (orderCount !== 5) {
+      throw new Error(`Expected 5 orders in DB, found ${orderCount}`);
+    }
+    console.log("✓ Concurrency invariant verified: exactly 5 orders created, 0 overselling, DB stock = 0.");
 
     // -------------------------------------------------------------
-    // Test 5: Manual Cancellation & Immediate Stock Restoration
+    // Test 5: Order Cancellation & Stock Restoration
     // -------------------------------------------------------------
-    console.log("\n[Test 5] Manual reservation cancellation & stock restoration");
-    const productBeforeCancel = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
-    const stockBefore = productBeforeCancel.availableStock;
+    console.log("\n[Test 5] Order Cancellation restores stock");
+    const stockBeforeCancel = (await prisma.product.findUniqueOrThrow({ where: { id: product.id } })).availableStock;
 
-    // Reserve 3 units
-    const resCancel = await fetch(`${BASE_URL}/reservations`, {
+    // Create a 1-item order to cancel
+    const cancelOrderSetup = await fetch(`${BASE_URL}/orders`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         productId: product.id,
         userId: "user-canceller",
-        quantity: 3,
+        quantity: 1,
       }),
     });
-    const { data: reservationToCancel } = (await resCancel.json()) as { data: { id: string } };
+    const { data: orderToCancel } = (await cancelOrderSetup.json()) as { data: { order: { id: string } } };
 
-    // Stock should have decreased by 3
-    const productAfterHold = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
-    if (productAfterHold.availableStock !== stockBefore - 3) {
-      throw new Error("Stock did not decrement after hold");
-    }
+    // Stock should now be stockBeforeCancel - 1
+    const stockDuringHold = (await prisma.product.findUniqueOrThrow({ where: { id: product.id } })).availableStock;
+    if (stockDuringHold !== stockBeforeCancel - 1) throw new Error("Stock did not decrement for order");
 
-    // Now cancel the reservation
-    const cancelRes = await fetch(`${BASE_URL}/reservations/${reservationToCancel.id}/cancel`, {
+    // Cancel order
+    const cancelRes = await fetch(`${BASE_URL}/orders/${orderToCancel.order.id}/cancel`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ userId: "user-canceller" }),
     });
-    if (cancelRes.status !== 200) {
-      throw new Error(`Cancel failed with status ${cancelRes.status}`);
+    if (cancelRes.status !== 200) throw new Error(`Cancel returned ${cancelRes.status}`);
+
+    // Verify stock is restored
+    const stockAfterCancel = (await prisma.product.findUniqueOrThrow({ where: { id: product.id } })).availableStock;
+    if (stockAfterCancel !== stockBeforeCancel) {
+      throw new Error(`Stock not restored: Expected ${stockBeforeCancel}, got ${stockAfterCancel}`);
     }
 
-    // Verify DB states: reservation is CANCELLED and product availableStock is fully restored
-    const dbCancelledRes = await prisma.reservation.findUniqueOrThrow({ where: { id: reservationToCancel.id } });
-    if (dbCancelledRes.status !== "CANCELLED") {
-      throw new Error(`Expected CANCELLED status, found ${dbCancelledRes.status}`);
+    const dbCancelledOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderToCancel.order.id },
+      include: { reservation: true },
+    });
+    if (dbCancelledOrder.status !== "CANCELLED" || dbCancelledOrder.reservation.status !== "CANCELLED") {
+      throw new Error("Order or reservation was not marked CANCELLED");
     }
-
-    const productAfterCancel = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
-    if (productAfterCancel.availableStock !== stockBefore) {
-      throw new Error(`Expected stock ${stockBefore} after cancel, found ${productAfterCancel.availableStock}`);
-    }
-    console.log("✓ Reservation cancelled. Status = CANCELLED. Available stock restored in DB.");
+    console.log("✓ Order and linked reservation marked CANCELLED. Inventory immediately returned to product.");
 
     // -------------------------------------------------------------
-    // Test 6: Cannot create order on CANCELLED reservation
+    // Test 6: Security & Idempotency: Imposter cancel & Double-cancel
     // -------------------------------------------------------------
-    console.log("\n[Test 6] Cannot order on CANCELLED reservation");
-    const cancelledOrderRes = await fetch(`${BASE_URL}/orders`, {
+    console.log("\n[Test 6] Security & State invariants: unauthorized cancel and re-cancel rejected");
+    const imposterCancel = await fetch(`${BASE_URL}/orders/${orderToCancel.order.id}/cancel`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        reservationId: reservationToCancel.id,
-        userId: "user-canceller",
-      }),
+      body: JSON.stringify({ userId: "user-imposter" }),
     });
-    if (cancelledOrderRes.status !== 409) {
-      throw new Error(`Expected 409 for cancelled hold, got ${cancelledOrderRes.status}`);
-    }
-    console.log("✓ Correctly rejected order on cancelled reservation with 409 Conflict.");
+    if (imposterCancel.status !== 403) throw new Error(`Expected 403, got ${imposterCancel.status}`);
+
+    const doubleCancel = await fetch(`${BASE_URL}/orders/${orderToCancel.order.id}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: "user-canceller" }),
+    });
+    if (doubleCancel.status !== 409) throw new Error(`Expected 409, got ${doubleCancel.status}`);
+    console.log("✓ Imposter cancel rejected with 403. Re-cancellation rejected with 409.");
 
     console.log("\n========================================================");
-    console.log("🎉 All Order & Reservation State Machine Tests PASSED!");
+    console.log("🎉 All Unified Order Integration Tests PASSED!");
     console.log("========================================================\n");
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
